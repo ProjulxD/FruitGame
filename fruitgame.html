@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FruitGame</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1117; overflow: hidden; }
+  canvas { display: block; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
+  video { display: none; }
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const ROUND_SECONDS = 60;
+const HOLD_SECONDS  = 0.8;   // so lange müssen beide Hände oben bleiben
+const RAISE_LINE    = 0.4;   // Handgelenk muss über 40 % der Bildhöhe liegen
+const SWIPE_SPEED   = 0.45;  // Bildbreiten pro Sekunde, ab der eine Bewegung als Schnitt zählt
+const BOMB_CHANCE   = 0.15;
+const COLORS = ["#ff4d6d", "#ff9f1c", "#ffd60a", "#3ddc84", "#38bdf8", "#a78bfa", "#f472b6"];
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d"), video = document.getElementById("v");
+let W = 0, H = 0;
+function resize() {
+  const k = Math.min(innerWidth / 16, innerHeight / 9);
+  W = cv.width = Math.floor(k * 16);
+  H = cv.height = Math.floor(k * 9);
+}
+addEventListener("resize", resize);
+resize();
+
+// ---------- Highscores (ohne Namen, nur Top 10) ----------
+const KEY = "fruitgame.top10";
+let highscores = [];
+try { highscores = JSON.parse(localStorage.getItem(KEY)) || []; } catch { highscores = []; }
+function saveScore(s) {
+  highscores.push(s);
+  highscores.sort((a, b) => b - a);
+  highscores = highscores.slice(0, 10);
+  try { localStorage.setItem(KEY, JSON.stringify(highscores)); } catch {}
+}
+
+// ---------- Zustand ----------
+let state = "loading", message = "Kamera und Modell werden geladen …";
+let landmarker = null;
+let fruits = [], halves = [], texts = [];
+let score = 0, timeLeft = ROUND_SECONDS, spawnTimer = 0, flash = 0;
+let hold = 0, cooldown = 0, lastScore = null;
+let wrists = [], prevTips = [];
+
+async function init() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: "user" }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    const opts = delegate => ({ baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: "VIDEO", numHands: 2 });
+    try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+    state = "menu";
+    cooldown = 0.5;
+  } catch (e) {
+    state = "error";
+    message = "Fehler: " + (e.message || e) + " – Kamera erlauben und die Seite über http://localhost oder https öffnen.";
+  }
+}
+
+// ---------- Spiellogik ----------
+function startRound() {
+  score = 0; timeLeft = ROUND_SECONDS; spawnTimer = 0.3;
+  fruits = []; halves = []; texts = []; prevTips = []; hold = 0;
+  state = "playing";
+}
+function endRound() {
+  lastScore = score;
+  saveScore(score);
+  fruits = []; hold = 0; cooldown = 2;
+  state = "menu";
+}
+function spawn() {
+  const r = H * 0.07, g = H * 1.5;
+  const apex = H * (0.55 + Math.random() * 0.35);
+  const x = W * (0.12 + Math.random() * 0.76);
+  fruits.push({
+    x, y: H + r, r,
+    vx: (W / 2 - x) * (0.1 + Math.random() * 0.3),
+    vy: -Math.sqrt(2 * g * apex),
+    bomb: Math.random() < BOMB_CHANCE,
+    color: COLORS[Math.floor(Math.random() * COLORS.length)]
+  });
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
+  let t = l ? ((px - ax) * dx + (py - ay) * dy) / l : 0;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+function addText(x, y, s, c) { texts.push({ x, y, s, c, life: 0.8 }); }
+function slice(ax, ay, bx, by) {
+  const ang = Math.atan2(by - ay, bx - ax);
+  for (const f of fruits) {
+    if (segDist(f.x, f.y, ax, ay, bx, by) >= f.r) continue;
+    f.dead = true;
+    if (f.bomb) {
+      score -= 3; flash = 1;
+      addText(f.x, f.y, "-3", "#ff5c5c");
+    } else {
+      score += 1;
+      addText(f.x, f.y, "+1", "#ffffff");
+      for (const s of [1, -1]) {
+        halves.push({
+          x: f.x, y: f.y, r: f.r, color: f.color, side: s, rot: ang,
+          vx: f.vx - Math.sin(ang) * s * W * 0.1,
+          vy: f.vy + Math.cos(ang) * s * W * 0.1,
+          vr: s * (2 + Math.random() * 3)
+        });
+      }
+    }
+  }
+  fruits = fruits.filter(f => !f.dead);
+}
+
+// Handpositionen aus dem Modell verarbeiten (Zeigefingerspitze = Landmark 8, Handgelenk = Landmark 0)
+function processHands(result, dt) {
+  const hands = result.landmarks || [];
+  wrists = hands.map(h => ({ x: (1 - h[0].x) * W, y: h[0].y * H }));
+  const tips = hands.map(h => ({ x: (1 - h[8].x) * W, y: h[8].y * H }));
+  const used = new Set();
+  for (const t of tips) {
+    let best = -1, bd = Infinity;
+    prevTips.forEach((p, i) => {
+      if (used.has(i)) return;
+      const d = Math.hypot(t.x - p.x, t.y - p.y);
+      if (d < bd) { bd = d; best = i; }
+    });
+    if (best >= 0 && bd < W * 0.5) {
+      used.add(best);
+      const p = prevTips[best];
+      t.trail = [...p.trail, { x: t.x, y: t.y }].slice(-8);
+      if (state === "playing" && dt > 0 && dt < 0.2 && bd / dt > W * SWIPE_SPEED) slice(p.x, p.y, t.x, t.y);
+    } else {
+      t.trail = [{ x: t.x, y: t.y }];
+    }
+  }
+  prevTips = tips;
+}
+
+function update(dt) {
+  const g = H * 1.5;
+  if (state === "playing") {
+    timeLeft -= dt;
+    if (timeLeft <= 0) { endRound(); }
+    else {
+      spawnTimer -= dt;
+      if (spawnTimer <= 0) {
+        spawn();
+        if (Math.random() < 0.3) spawn();
+        spawnTimer = 0.5 + Math.random() * 0.5;
+      }
+    }
+  } else if (state === "menu") {
+    cooldown -= dt;
+    const raised = cooldown <= 0 && wrists.length === 2 && wrists.every(w => w.y < H * RAISE_LINE);
+    hold = raised ? hold + dt : 0;
+    if (hold >= HOLD_SECONDS) startRound();
+  }
+  for (const f of fruits) { f.vy += g * dt; f.x += f.vx * dt; f.y += f.vy * dt; }
+  fruits = fruits.filter(f => !(f.vy > 0 && f.y > H + f.r));
+  for (const h of halves) { h.vy += g * dt; h.x += h.vx * dt; h.y += h.vy * dt; h.rot += h.vr * dt; }
+  halves = halves.filter(h => h.y < H + h.r * 2);
+  for (const t of texts) { t.life -= dt; t.y -= H * 0.1 * dt; }
+  texts = texts.filter(t => t.life > 0);
+  flash = Math.max(0, flash - dt * 2);
+}
+
+// ---------- Zeichnen ----------
+function drawBall(x, y, r, c) {
+  ctx.fillStyle = c;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
+  ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.3, 0, Math.PI * 2); ctx.fill();
+}
+function drawBomb(f) {
+  ctx.fillStyle = "#222";
+  ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#ff3b3b"; ctx.lineWidth = 5; ctx.stroke();
+  ctx.font = `${f.r * 1.4}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#fff"; ctx.fillText("💣", f.x, f.y + 2);
+}
+function label(s, x, y, size, align = "left", color = "#fff") {
+  ctx.font = `700 ${size}px system-ui, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = "alphabetic";
+  ctx.shadowColor = "rgba(0,0,0,0.6)"; ctx.shadowBlur = 8;
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+  ctx.shadowBlur = 0;
+}
+function drawMenu() {
+  ctx.fillStyle = "rgba(8,10,20,0.72)"; ctx.fillRect(0, 0, W, H);
+  const lx = W * 0.07;
+  label("FruitGame", lx, H * 0.3, H * 0.13);
+  if (lastScore !== null) label(`Letzte Runde: ${lastScore} Punkte`, lx, H * 0.4, H * 0.05, "left", "#ffd60a");
+  label("Beide Hände in die Luft heben,", lx, H * 0.58, H * 0.05);
+  label("um eine Runde zu starten.", lx, H * 0.645, H * 0.05);
+  // Fortschrittsbalken fürs Halten der Geste
+  const bw = W * 0.3, bh = H * 0.025, by = H * 0.7;
+  ctx.fillStyle = "rgba(255,255,255,0.2)"; ctx.fillRect(lx, by, bw, bh);
+  ctx.fillStyle = "#3ddc84"; ctx.fillRect(lx, by, bw * Math.min(1, hold / HOLD_SECONDS), bh);
+  label(`Hände erkannt: ${wrists.length}/2`, lx, H * 0.79, H * 0.032, "left", "#9aa4b2");
+  // Linie, über die die Hände müssen
+  ctx.setLineDash([12, 10]); ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, H * RAISE_LINE); ctx.lineTo(W, H * RAISE_LINE); ctx.stroke();
+  ctx.setLineDash([]);
+  // Top 10
+  const px = W * 0.58, py = H * 0.1, pw = W * 0.34, ph = H * 0.8;
+  ctx.fillStyle = "rgba(255,255,255,0.08)";
+  ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 16); ctx.fill();
+  label("Top 10", px + pw / 2, py + H * 0.09, H * 0.06, "center");
+  const hi = lastScore !== null ? highscores.indexOf(lastScore) : -1;
+  for (let i = 0; i < 10; i++) {
+    const y = py + H * 0.18 + i * H * 0.058;
+    const c = i === hi ? "#ffd60a" : "#fff";
+    label(`${i + 1}.`, px + pw * 0.12, y, H * 0.042, "left", c);
+    label(highscores[i] !== undefined ? String(highscores[i]) : "–", px + pw * 0.88, y, H * 0.042, "right", c);
+  }
+}
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  if (video.readyState >= 2) {
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, W, H);
+    ctx.restore();
+    ctx.fillStyle = "rgba(0,0,0,0.35)"; ctx.fillRect(0, 0, W, H);
+  } else {
+    ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, W, H);
+  }
+  if (state === "loading" || state === "error") {
+    label(message, W / 2, H / 2, H * 0.035, "center");
+    return;
+  }
+  for (const h of halves) {
+    ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(h.rot);
+    ctx.fillStyle = h.color;
+    ctx.beginPath();
+    if (h.side === 1) ctx.arc(0, 0, h.r, 0, Math.PI); else ctx.arc(0, 0, h.r, Math.PI, Math.PI * 2);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 3; ctx.stroke();
+    ctx.restore();
+  }
+  for (const f of fruits) f.bomb ? drawBomb(f) : drawBall(f.x, f.y, f.r, f.color);
+  for (const t of texts) {
+    ctx.globalAlpha = Math.max(0, t.life / 0.8);
+    label(t.s, t.x, t.y, H * 0.07, "center", t.c);
+    ctx.globalAlpha = 1;
+  }
+  if (state === "menu") drawMenu();
+  // Hand-Spuren
+  ctx.lineCap = "round";
+  for (const t of prevTips) {
+    for (let i = 1; i < t.trail.length; i++) {
+      ctx.strokeStyle = `rgba(120,220,255,${i / t.trail.length})`;
+      ctx.lineWidth = 2 + i * 1.2;
+      ctx.beginPath(); ctx.moveTo(t.trail[i - 1].x, t.trail[i - 1].y); ctx.lineTo(t.trail[i].x, t.trail[i].y); ctx.stroke();
+    }
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(t.x, t.y, 10, 0, Math.PI * 2); ctx.fill();
+  }
+  if (state === "menu") {
+    ctx.fillStyle = "#3ddc84";
+    for (const w of wrists) { ctx.beginPath(); ctx.arc(w.x, w.y, 9, 0, Math.PI * 2); ctx.fill(); }
+  }
+  if (state === "playing") {
+    label(`Punkte: ${score}`, W * 0.03, H * 0.09, H * 0.07);
+    label(`${Math.ceil(timeLeft)} s`, W * 0.97, H * 0.09, H * 0.07, "right", timeLeft <= 10 ? "#ff5c5c" : "#fff");
+  }
+  if (flash > 0) { ctx.fillStyle = `rgba(255,40,40,${flash * 0.5})`; ctx.fillRect(0, 0, W, H); }
+}
+
+// ---------- Hauptschleife ----------
+let last = performance.now(), lastVideoTime = -1, lastDetect = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const detDt = (now - lastDetect) / 1000;
+    lastDetect = now;
+    processHands(landmarker.detectForVideo(video, now), detDt);
+  }
+  update(dt);
+  draw();
+}
+addEventListener("keydown", e => { if (e.code === "Space" && state === "menu") startRound(); });
+
+init();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
