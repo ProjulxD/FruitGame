@@ -24,8 +24,63 @@ const ROUND_SECONDS = 60;
 const HOLD_SECONDS  = 0.8;   // so lange müssen beide Hände oben bleiben
 const RAISE_LINE    = 0.4;   // Handgelenk muss über 40 % der Bildhöhe liegen
 const SWIPE_SPEED   = 0.45;  // Bildbreiten pro Sekunde, ab der eine Bewegung als Schnitt zählt
-const BOMB_CHANCE   = 0.15;
-const COLORS = ["#ff4d6d", "#ff9f1c", "#ffd60a", "#3ddc84", "#38bdf8", "#a78bfa", "#f472b6"];
+const LIVES         = 3;     // Bombentreffer bis Spielende
+const COMBO_EVERY   = 5;     // alle x Früchte in Folge gibt es Bonuspunkte
+const COMBO_BONUS   = 2;     // Bonuspunkte pro Combo-Meilenstein (0 = kein Bonus)
+const DIFFS = [
+  { name: "Leicht", speed: 0.85, bomb: 0.08, gap: 1.0,  color: "#3ddc84" },
+  { name: "Mittel", speed: 1.0,  bomb: 0.15, gap: 0.85, color: "#ffd60a" },
+  { name: "Schwer", speed: 1.25, bomb: 0.28, gap: 0.7,  color: "#ff5c5c" }
+];
+
+// ---------- Sprites (einmal vorab gezeichnet) ----------
+const S = 64, TAU = Math.PI * 2;
+const mk = () => Object.assign(document.createElement("canvas"), { width: S * 2, height: S * 2 });
+const disc = (g, r, c, a0 = 0, a1 = TAU) => { g.fillStyle = c; g.beginPath(); g.arc(0, 0, r, a0, a1); g.closePath(); g.fill(); };
+const dots = (g, pts, c, rx, ry) => { g.fillStyle = c; for (const [x, y] of pts) { g.beginPath(); g.ellipse(x * S, y * S, rx * S, ry * S, 0, 0, TAU); g.fill(); } };
+const segs = (g, n) => { g.strokeStyle = "rgba(255,255,255,.55)"; g.lineWidth = 3; for (let i = 1; i < n; i++) { const a = i * Math.PI / n; g.beginPath(); g.moveTo(0, 0); g.lineTo(Math.cos(a) * S * .82, Math.sin(a) * S * .82); g.stroke(); } };
+const FRUITS = [
+  { skin: "#ff9f1c", hi: "#ffd27a", rim: "#d97706", pith: "#fff0c8", flesh: "#ffb733",   // Orange
+    whole: g => dots(g, [[-.3,.2],[.2,.45],[.45,-.1],[-.1,-.35],[.1,.05],[-.5,-.2],[.35,.3]], "rgba(180,80,0,.35)", .03, .03),
+    half: g => segs(g, 6) },
+  { skin: "#e63946", hi: "#ff8a94", rim: "#a4161a", pith: "#f7f3d7", flesh: "#f7f3d7",   // Apfel
+    whole: g => { g.strokeStyle = "#5b3a1a"; g.lineWidth = 5; g.lineCap = "round"; g.beginPath(); g.moveTo(0, -S * .72); g.quadraticCurveTo(S * .05, -S * .55, S * .12, -S * .5); g.stroke(); },
+    half: g => dots(g, [[-.14,.3],[0,.38],[.14,.3]], "#4a2c12", .05, .09) },
+  { skin: "#2fa14f", hi: "#7fd995", rim: "#17612d", pith: "#e8f7d0", flesh: "#ff5a6e",   // Wassermelone
+    whole: g => { g.save(); g.beginPath(); g.arc(0, 0, S, 0, TAU); g.clip(); g.strokeStyle = "rgba(8,70,30,.55)"; g.lineWidth = 6; for (let i = -2; i <= 2; i++) { g.beginPath(); g.ellipse(i * S * .34, 0, S * .16, S * 1.05, 0, 0, TAU); g.stroke(); } g.restore(); },
+    half: g => dots(g, [[-.4,.3],[-.2,.5],[0,.32],[.2,.5],[.4,.3],[0,.62]], "#1a1a1a", .04, .07) },
+  { skin: "#9c7a4a", hi: "#cfae78", rim: "#6b4f2a", pith: "#d9e8a0", flesh: "#8bd12a",   // Kiwi
+    whole: g => dots(g, [[-.4,-.1],[.3,.3],[.1,-.5],[-.2,.5],[.5,-.2],[-.5,.3],[.0,.05]], "rgba(70,45,15,.4)", .04, .03),
+    half: g => { dots(g, [[0,0]], "#e6f5b0", .26, .2); dots(g, [[-.5,.3],[-.35,.55],[0,.65],[.35,.55],[.5,.3]], "#1a1a1a", .035, .06); } },
+  { skin: "#5fbf3f", hi: "#a6ea7a", rim: "#2f7d20", pith: "#eaf7c8", flesh: "#c7ec7a",   // Limette
+    whole: g => dots(g, [[-.3,.2],[.2,.4],[.4,-.2],[-.1,-.4]], "rgba(20,90,10,.3)", .03, .03),
+    half: g => segs(g, 8) },
+  { skin: "#7a2e91", hi: "#c07ad8", rim: "#3f1450", pith: "#f5d98a", flesh: "#f5b942",   // Pflaume
+    whole: () => {},
+    half: g => dots(g, [[0,.4]], "#8a5a2b", .22, .3) }
+];
+const SPRITES = FRUITS.map(t => {
+  const w = mk(), g = w.getContext("2d"); g.translate(S, S);
+  const gr = g.createRadialGradient(-S * .35, -S * .35, S * .1, 0, 0, S);
+  gr.addColorStop(0, t.hi); gr.addColorStop(.55, t.skin); gr.addColorStop(1, t.rim);
+  g.fillStyle = gr; g.beginPath(); g.arc(0, 0, S, 0, TAU); g.fill();
+  t.whole(g);
+  g.fillStyle = "rgba(255,255,255,.4)"; g.beginPath(); g.ellipse(-S * .36, -S * .42, S * .2, S * .1, -.7, 0, TAU); g.fill();
+  const h = mk(), k = h.getContext("2d"); k.translate(S, S);   // untere Hälfte, Schnittkante oben
+  disc(k, S, t.skin, 0, Math.PI); disc(k, S * .92, t.pith, 0, Math.PI); disc(k, S * .84, t.flesh, 0, Math.PI);
+  t.half(k);
+  return { whole: w, half: h };
+});
+const BOMB = (() => {
+  const c = mk(), g = c.getContext("2d"); g.translate(S, S);
+  const gr = g.createRadialGradient(-S * .3, -S * .3, S * .1, 0, 0, S * .88);
+  gr.addColorStop(0, "#5a5f6b"); gr.addColorStop(1, "#14161b");
+  g.fillStyle = gr; g.beginPath(); g.arc(0, 0, S * .88, 0, TAU); g.fill();
+  g.strokeStyle = "#ff3b3b"; g.lineWidth = 6; g.stroke();
+  g.strokeStyle = "#c9a26b"; g.lineCap = "round"; g.beginPath(); g.moveTo(S * .35, -S * .75); g.quadraticCurveTo(S * .6, -S * 1.0, S * .8, -S * .85); g.stroke();
+  g.fillStyle = "#ffd60a"; g.beginPath(); g.arc(S * .8, -S * .85, 7, 0, TAU); g.fill();
+  return c;
+})();
 
 const cv = document.getElementById("c"), ctx = cv.getContext("2d"), video = document.getElementById("v");
 let W = 0, H = 0;
@@ -38,22 +93,20 @@ addEventListener("resize", resize);
 resize();
 
 // ---------- Highscores (ohne Namen, nur Top 10) ----------
-const KEY = "fruitgame.top10";
-let highscores = [];
-try { highscores = JSON.parse(localStorage.getItem(KEY)) || []; } catch { highscores = []; }
-function saveScore(s) {
-  highscores.push(s);
-  highscores.sort((a, b) => b - a);
-  highscores = highscores.slice(0, 10);
-  try { localStorage.setItem(KEY, JSON.stringify(highscores)); } catch {}
+const KEY = i => "fruitgame.top10." + DIFFS[i].name;
+let boards = DIFFS.map((_, i) => { try { return JSON.parse(localStorage.getItem(KEY(i))) || []; } catch { return []; } });
+function saveScore(sc) {
+  const b = boards[diff]; b.push(sc); b.sort((x, y) => y - x);
+  boards[diff] = b.slice(0, 10);
+  try { localStorage.setItem(KEY(diff), JSON.stringify(boards[diff])); } catch {}
 }
 
 // ---------- Zustand ----------
 let state = "loading", message = "Kamera und Modell werden geladen …";
 let landmarker = null;
 let fruits = [], halves = [], texts = [];
-let score = 0, timeLeft = ROUND_SECONDS, spawnTimer = 0, flash = 0;
-let hold = 0, cooldown = 0, lastScore = null;
+let score = 0, lives = LIVES, combo = 0, bestCombo = 0, timeLeft = ROUND_SECONDS, spawnTimer = 0, flash = 0;
+let hold = 0, cooldown = 0, lastScore = null, lastBest = 0, lastReason = "time", diff = 1, lastDiff = 1, dwell = 0, dwellIdx = -1;
 let wrists = [], prevTips = [];
 
 async function init() {
@@ -77,12 +130,12 @@ async function init() {
 
 // ---------- Spiellogik ----------
 function startRound() {
-  score = 0; timeLeft = ROUND_SECONDS; spawnTimer = 0.3;
-  fruits = []; halves = []; texts = []; prevTips = []; hold = 0;
+  score = 0; lives = LIVES; combo = 0; bestCombo = 0; timeLeft = ROUND_SECONDS; spawnTimer = 0.3;
+  fruits = []; halves = []; texts = []; prevTips = []; hold = 0; dwell = 0; dwellIdx = -1;
   state = "playing";
 }
-function endRound() {
-  lastScore = score;
+function endRound(reason) {
+  lastScore = score; lastDiff = diff; lastBest = bestCombo; lastReason = reason;
   saveScore(score);
   fruits = []; hold = 0; cooldown = 2;
   state = "menu";
@@ -95,8 +148,9 @@ function spawn() {
     x, y: H + r, r,
     vx: (W / 2 - x) * (0.1 + Math.random() * 0.3),
     vy: -Math.sqrt(2 * g * apex),
-    bomb: Math.random() < BOMB_CHANCE,
-    color: COLORS[Math.floor(Math.random() * COLORS.length)]
+    bomb: Math.random() < DIFFS[diff].bomb,
+    kind: Math.floor(Math.random() * SPRITES.length),
+    rot: 0, vr: (Math.random() - 0.5) * 4
   });
 }
 function segDist(px, py, ax, ay, bx, by) {
@@ -112,14 +166,16 @@ function slice(ax, ay, bx, by) {
     if (segDist(f.x, f.y, ax, ay, bx, by) >= f.r) continue;
     f.dead = true;
     if (f.bomb) {
-      score -= 3; flash = 1;
+      score -= 3; lives--; combo = 0; flash = 1;
       addText(f.x, f.y, "-3", "#ff5c5c");
     } else {
+      combo++; bestCombo = Math.max(bestCombo, combo);
       score += 1;
-      addText(f.x, f.y, "+1", "#ffffff");
+      addText(f.x, f.y, combo >= 3 ? `+1  x${combo}` : "+1", "#ffffff");
+      if (COMBO_BONUS && combo % COMBO_EVERY === 0) { score += COMBO_BONUS; addText(f.x, f.y - f.r * 1.5, `Combo +${COMBO_BONUS}`, "#ffd60a"); }
       for (const s of [1, -1]) {
         halves.push({
-          x: f.x, y: f.y, r: f.r, color: f.color, side: s, rot: ang,
+          x: f.x, y: f.y, r: f.r, kind: f.kind, side: s, rot: ang,
           vx: f.vx - Math.sin(ang) * s * W * 0.1,
           vy: f.vy + Math.cos(ang) * s * W * 0.1,
           vr: s * (2 + Math.random() * 3)
@@ -156,27 +212,35 @@ function processHands(result, dt) {
 }
 
 function update(dt) {
-  const g = H * 1.5;
+  const g = H * 1.5, fdt = dt * DIFFS[diff].speed;
   if (state === "playing") {
     timeLeft -= dt;
-    if (timeLeft <= 0) { endRound(); }
+    if (lives <= 0) endRound("bombs");
+    else if (timeLeft <= 0) endRound("time");
     else {
       spawnTimer -= dt;
       if (spawnTimer <= 0) {
         spawn();
         if (Math.random() < 0.3) spawn();
-        spawnTimer = 0.5 + Math.random() * 0.5;
+        spawnTimer = (0.5 + Math.random() * 0.5) * DIFFS[diff].gap;
       }
     }
   } else if (state === "menu") {
+    let over = -1;
+    for (const t of prevTips) DIFFS.forEach((_, i) => { const b = btn(i); if (t.x > b.x && t.x < b.x + b.w && t.y > b.y && t.y < b.y + b.h) over = i; });
+    if (over >= 0 && over !== diff) {
+      dwell = over === dwellIdx ? dwell + dt : 0; dwellIdx = over;
+      if (dwell >= HOLD_SECONDS) { diff = over; dwell = 0; dwellIdx = -1; }
+    } else { dwell = 0; dwellIdx = -1; }
     cooldown -= dt;
     const raised = cooldown <= 0 && wrists.length === 2 && wrists.every(w => w.y < H * RAISE_LINE);
     hold = raised ? hold + dt : 0;
     if (hold >= HOLD_SECONDS) startRound();
   }
-  for (const f of fruits) { f.vy += g * dt; f.x += f.vx * dt; f.y += f.vy * dt; }
-  fruits = fruits.filter(f => !(f.vy > 0 && f.y > H + f.r));
-  for (const h of halves) { h.vy += g * dt; h.x += h.vx * dt; h.y += h.vy * dt; h.rot += h.vr * dt; }
+  for (const f of fruits) { f.vy += g * fdt; f.x += f.vx * fdt; f.y += f.vy * fdt; f.rot += f.vr * fdt; }
+  for (const f of fruits) if (f.vy > 0 && f.y > H + f.r) { f.gone = true; if (!f.bomb && state === "playing") combo = 0; }
+  fruits = fruits.filter(f => !f.gone);
+  for (const h of halves) { h.vy += g * fdt; h.x += h.vx * fdt; h.y += h.vy * fdt; h.rot += h.vr * fdt; }
   halves = halves.filter(h => h.y < H + h.r * 2);
   for (const t of texts) { t.life -= dt; t.y -= H * 0.1 * dt; }
   texts = texts.filter(t => t.life > 0);
@@ -184,18 +248,8 @@ function update(dt) {
 }
 
 // ---------- Zeichnen ----------
-function drawBall(x, y, r, c) {
-  ctx.fillStyle = c;
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = "rgba(255,255,255,0.35)";
-  ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.3, 0, Math.PI * 2); ctx.fill();
-}
-function drawBomb(f) {
-  ctx.fillStyle = "#222";
-  ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = "#ff3b3b"; ctx.lineWidth = 5; ctx.stroke();
-  ctx.font = `${f.r * 1.4}px serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  ctx.fillStyle = "#fff"; ctx.fillText("💣", f.x, f.y + 2);
+function drawSprite(img, x, y, r, rot) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.drawImage(img, -r, -r, r * 2, r * 2); ctx.restore();
 }
 function label(s, x, y, size, align = "left", color = "#fff") {
   ctx.font = `700 ${size}px system-ui, sans-serif`;
@@ -204,33 +258,45 @@ function label(s, x, y, size, align = "left", color = "#fff") {
   ctx.fillStyle = color; ctx.fillText(s, x, y);
   ctx.shadowBlur = 0;
 }
+const btn = i => ({ x: W * 0.07 + i * W * 0.145, y: H * 0.44, w: W * 0.13, h: H * 0.085 });
 function drawMenu() {
   ctx.fillStyle = "rgba(8,10,20,0.72)"; ctx.fillRect(0, 0, W, H);
-  const lx = W * 0.07;
-  label("FruitGame", lx, H * 0.3, H * 0.13);
-  if (lastScore !== null) label(`Letzte Runde: ${lastScore} Punkte`, lx, H * 0.4, H * 0.05, "left", "#ffd60a");
-  label("Beide Hände in die Luft heben,", lx, H * 0.58, H * 0.05);
-  label("um eine Runde zu starten.", lx, H * 0.645, H * 0.05);
-  // Fortschrittsbalken fürs Halten der Geste
-  const bw = W * 0.3, bh = H * 0.025, by = H * 0.7;
+  const lx = W * 0.07, board = boards[diff];
+  label("FruitGame", lx, H * 0.21, H * 0.12);
+  if (lastScore !== null) {
+    const bombs = lastReason === "bombs";
+    label(bombs ? "Game Over – 3 Bomben getroffen" : "Zeit abgelaufen", lx, H * 0.29, H * 0.04, "left", bombs ? "#ff5c5c" : "#fff");
+    label(`${lastScore} Punkte, beste Combo ${lastBest} (${DIFFS[lastDiff].name})`, lx, H * 0.35, H * 0.035, "left", "#ffd60a");
+  }
+  DIFFS.forEach((d, i) => {
+    const b = btn(i), on = i === diff;
+    ctx.fillStyle = on ? d.color : "rgba(255,255,255,0.12)";
+    ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 12); ctx.fill();
+    if (i === dwellIdx && !on) {
+      ctx.save(); ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 12); ctx.clip();
+      ctx.fillStyle = d.color; ctx.globalAlpha = 0.85;
+      ctx.fillRect(b.x, b.y, b.w * Math.min(1, dwell / HOLD_SECONDS), b.h); ctx.restore();
+    }
+    label(d.name, b.x + b.w / 2, b.y + b.h * 0.65, H * 0.04, "center", on ? "#111" : "#fff");
+  });
+  label("Schwierigkeit: Finger über dem Button halten (oder Taste 1/2/3)", lx, H * 0.58, H * 0.026, "left", "#9aa4b2");
+  label("Beide Hände in die Luft heben, um zu starten.", lx, H * 0.68, H * 0.04);
+  const bw = W * 0.3, bh = H * 0.025, by = H * 0.73;
   ctx.fillStyle = "rgba(255,255,255,0.2)"; ctx.fillRect(lx, by, bw, bh);
   ctx.fillStyle = "#3ddc84"; ctx.fillRect(lx, by, bw * Math.min(1, hold / HOLD_SECONDS), bh);
-  label(`Hände erkannt: ${wrists.length}/2`, lx, H * 0.79, H * 0.032, "left", "#9aa4b2");
-  // Linie, über die die Hände müssen
+  label(`Hände erkannt: ${wrists.length}/2`, lx, H * 0.84, H * 0.032, "left", "#9aa4b2");
   ctx.setLineDash([12, 10]); ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(0, H * RAISE_LINE); ctx.lineTo(W, H * RAISE_LINE); ctx.stroke();
   ctx.setLineDash([]);
-  // Top 10
   const px = W * 0.58, py = H * 0.1, pw = W * 0.34, ph = H * 0.8;
   ctx.fillStyle = "rgba(255,255,255,0.08)";
   ctx.beginPath(); ctx.roundRect(px, py, pw, ph, 16); ctx.fill();
-  label("Top 10", px + pw / 2, py + H * 0.09, H * 0.06, "center");
-  const hi = lastScore !== null ? highscores.indexOf(lastScore) : -1;
+  label(`Top 10 – ${DIFFS[diff].name}`, px + pw / 2, py + H * 0.09, H * 0.055, "center");
+  const hi = lastScore !== null && lastDiff === diff ? board.indexOf(lastScore) : -1;
   for (let i = 0; i < 10; i++) {
-    const y = py + H * 0.18 + i * H * 0.058;
-    const c = i === hi ? "#ffd60a" : "#fff";
+    const y = py + H * 0.18 + i * H * 0.058, c = i === hi ? "#ffd60a" : "#fff";
     label(`${i + 1}.`, px + pw * 0.12, y, H * 0.042, "left", c);
-    label(highscores[i] !== undefined ? String(highscores[i]) : "–", px + pw * 0.88, y, H * 0.042, "right", c);
+    label(board[i] !== undefined ? String(board[i]) : "–", px + pw * 0.88, y, H * 0.042, "right", c);
   }
 }
 function draw() {
@@ -247,16 +313,8 @@ function draw() {
     label(message, W / 2, H / 2, H * 0.035, "center");
     return;
   }
-  for (const h of halves) {
-    ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(h.rot);
-    ctx.fillStyle = h.color;
-    ctx.beginPath();
-    if (h.side === 1) ctx.arc(0, 0, h.r, 0, Math.PI); else ctx.arc(0, 0, h.r, Math.PI, Math.PI * 2);
-    ctx.closePath(); ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,0.7)"; ctx.lineWidth = 3; ctx.stroke();
-    ctx.restore();
-  }
-  for (const f of fruits) f.bomb ? drawBomb(f) : drawBall(f.x, f.y, f.r, f.color);
+  for (const h of halves) drawSprite(SPRITES[h.kind].half, h.x, h.y, h.r, h.rot + (h.side === -1 ? Math.PI : 0));
+  for (const f of fruits) drawSprite(f.bomb ? BOMB : SPRITES[f.kind].whole, f.x, f.y, f.r, f.rot);
   for (const t of texts) {
     ctx.globalAlpha = Math.max(0, t.life / 0.8);
     label(t.s, t.x, t.y, H * 0.07, "center", t.c);
@@ -279,6 +337,8 @@ function draw() {
   }
   if (state === "playing") {
     label(`Punkte: ${score}`, W * 0.03, H * 0.09, H * 0.07);
+    for (let i = 0; i < LIVES; i++) label("♥", W * 0.03 + i * H * 0.065, H * 0.17, H * 0.06, "left", i < lives ? "#ff4d6d" : "rgba(255,255,255,0.3)");
+    if (combo >= 2) label(`Combo x${combo}`, W * 0.03, H * 0.25, H * 0.05, "left", "#ffd60a");
     label(`${Math.ceil(timeLeft)} s`, W * 0.97, H * 0.09, H * 0.07, "right", timeLeft <= 10 ? "#ff5c5c" : "#fff");
   }
   if (flash > 0) { ctx.fillStyle = `rgba(255,40,40,${flash * 0.5})`; ctx.fillRect(0, 0, W, H); }
@@ -299,7 +359,11 @@ function frame(now) {
   update(dt);
   draw();
 }
-addEventListener("keydown", e => { if (e.code === "Space" && state === "menu") startRound(); });
+addEventListener("keydown", e => {
+  if (state !== "menu") return;
+  if (e.code === "Space") startRound();
+  else if (["1", "2", "3"].includes(e.key)) diff = +e.key - 1;
+});
 
 init();
 requestAnimationFrame(frame);
